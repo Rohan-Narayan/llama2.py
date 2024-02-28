@@ -16,8 +16,9 @@ class Config:
     n_kv_heads: int
     vocab_size: int
     seq_len: int
+    quant: bool
 
-    def __init__(self, dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len):
+    def __init__(self, dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len, quant):
         self.dim = dim
         self.hidden_dim = hidden_dim
         self.n_layers = n_layers
@@ -25,6 +26,7 @@ class Config:
         self.n_kv_heads = n_kv_heads
         self.vocab_size = vocab_size
         self.seq_len = seq_len
+        self.quant = quant
 
 
 class TransformerWeights:
@@ -121,16 +123,60 @@ def softmax(x, size):
         x[i] /= exp_sum
     return x
 
+def quantize(vector, scale_factor):
+    # absmax quantization
+    # scale_factor = 127 / max(vector)
 
-def matmul(xout, x, w, n, d):
+    return [round(value * scale_factor) for value in vector]
+
+def dequantize(vector, scale_factor):
+
+    return [value / scale_factor for value in vector]
+
+def matmul(xout, x, w, n, d, quant):
     # W (d,n) @ x (n,) -> xout (d,)
     # by far the most amount of time is spent inside this little function
-    for i in range(d):
-        val = 0.0
+    if quant:
+        outlier_threshold = 6.0
+        # Extract outliers from x by column and corresponding rows in W
+        x_outliers = []
+        w_outliers = []
+        x_non_outliers = []
+        w_non_outliers = []
+
         for j in range(n):
-            val += w[i * n + j] * x[j]
-        xout[i] = val
-    return xout
+            if abs(x[j]) > outlier_threshold:
+                x_outliers.append(x[j])
+                w_outliers.extend(w[j*d: j*d+n])
+            else:
+                x_non_outliers.append(x[j])
+                w_non_outliers.extend(w[j*d: j*d+n])
+
+        # Matmul outliers in fp16
+        res_fp16 = [0.0] * d
+        res_fp16 = matmul(res_fp16, x_outliers, w_outliers, len(x_outliers), d, False)
+
+        # Matmul non-outliers in int8
+        scale_factor = 127 / max(max(x_non_outliers), max(w_non_outliers))
+        res_int8 = [0] * d
+        res_int8 = matmul(res_int8, quantize(x_non_outliers, scale_factor), 
+                          quantize(w_non_outliers, scale_factor), len(x_non_outliers), 
+                          d, False)
+        
+        # Convert non-outliers back to fp16
+        res_int8 = dequantize(res_int8, scale_factor)
+
+        # Sum outlier result and non-outlier result
+        xout = res_fp16 + res_int8
+
+        return xout
+    else:
+        for i in range(d):
+            val = 0.0
+            for j in range(n):
+                val += w[i * n + j] * x[j]
+            xout[i] = val
+        return xout
 
 
 class RunState:
@@ -172,9 +218,11 @@ def transformer(token: int, pos: int, conf: Config, state: RunState, weights: Tr
         state.xb = rmsnorm(state.xb, x, weights.rms_att_weight[l * dim: (l + 1) * dim])
 
         # QKV matmuls for this position
-        state.q = matmul(state.q, state.xb, weights.wq[l * dim * dim: (l + 1) * dim * dim], dim, dim)
-        state.k = matmul(state.k, state.xb, weights.wk[l * dim * dim: (l + 1) * dim * dim], dim, dim)
-        state.v = matmul(state.v, state.xb, weights.wv[l * dim * dim: (l + 1) * dim * dim], dim, dim)
+
+        
+        state.q = matmul(state.q, state.xb, weights.wq[l * dim * dim: (l + 1) * dim * dim], dim, dim, conf.quant)
+        state.k = matmul(state.k, state.xb, weights.wk[l * dim * dim: (l + 1) * dim * dim], dim, dim, conf.quant)
+        state.v = matmul(state.v, state.xb, weights.wv[l * dim * dim: (l + 1) * dim * dim], dim, dim, conf.quant)
 
         # Apply RoPE rotation to the q and k vectors for each head
         for h in range(conf.n_heads):
@@ -239,7 +287,7 @@ def transformer(token: int, pos: int, conf: Config, state: RunState, weights: Tr
                     state.xb[xb_ptr + i] += a * v[i]
 
         # Final matrix multiplication to get the output of the attention
-        state.xb2 = matmul(state.xb2, state.xb, weights.wo[l * dim * dim:(l + 1) * dim * dim], dim, dim)
+        state.xb2 = matmul(state.xb2, state.xb, weights.wo[l * dim * dim:(l + 1) * dim * dim], dim, dim, conf.quant)
 
         # Residual connection back into x
         x = accum(x, state.xb2)
@@ -251,11 +299,11 @@ def transformer(token: int, pos: int, conf: Config, state: RunState, weights: Tr
         state.hb = matmul(state.hb, state.xb,
                           weights.w1[l * dim * hidden_dim:
                                      (l + 1) * dim * hidden_dim],
-                          dim, hidden_dim)
+                          dim, hidden_dim, conf.quant)
 
         state.hb2 = matmul(state.hb2, state.xb, weights.w3[l * dim * hidden_dim:
                                                            (l + 1) * dim * hidden_dim],
-                           dim, hidden_dim)
+                           dim, hidden_dim, conf.quant)
 
         # Apply SiLU activation function (silu(x) = x * sigmoid(x))
         state.hb = [state.hb[i] * (1.0 / (1.0 + math.exp(-state.hb[i])))
@@ -269,7 +317,7 @@ def transformer(token: int, pos: int, conf: Config, state: RunState, weights: Tr
                                                          (
                                                                  (l + 1)
                                                                  * dim * hidden_dim
-                                                         )], hidden_dim, dim)
+                                                         )], hidden_dim, dim, conf.quant)
 
         # Residual connection
         x = accum(x, state.xb)
@@ -278,7 +326,7 @@ def transformer(token: int, pos: int, conf: Config, state: RunState, weights: Tr
     x = rmsnorm(x, x, weights.rms_final_weight)
 
     # Classifier into logits
-    state.logits = matmul(state.logits, x, weights.wcls, dim, conf.vocab_size)
+    state.logits = matmul(state.logits, x, weights.wcls, dim, conf.vocab_size, conf.quant)
 
 
 def str_lookup(string, vocab):
@@ -378,6 +426,7 @@ def run(args):
     temperature = float(args["temperature"])
     steps = int(args["steps"])
     prompt = args["prompt"]
+    quantized = False if args["quantized"] == "False" else True
 
     rng_seed = int(time.time())
     random.seed(rng_seed)
@@ -391,7 +440,7 @@ def run(args):
         # Unpacking the data
         dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len = struct.unpack('7i', _config)
         # Creating a Config object
-        config = Config(dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len)
+        config = Config(dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len, quantized)
 
         # negative vocab size is hacky way of signaling unshared weights. bit yikes.
         shared_weights = 1 if config.vocab_size > 0 else 0
@@ -475,7 +524,8 @@ if __name__ == "__main__":
         "checkpoint": './out/stories15M.bin',
         "temperature": "0.0",
         "steps": "256",
-        "prompt": None
+        "prompt": None,
+        "quantized": "False"
     }
     # if len(sys.argv) < 2:
     #     print(
@@ -493,5 +543,8 @@ if __name__ == "__main__":
 
     if len(sys.argv) >= 5:
         args["prompt"] = sys.argv[4]
+
+    if len(sys.argv) >= 6:
+        args["quantized"] = sys.argv[5]
 
     run(args)
