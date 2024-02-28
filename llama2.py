@@ -126,11 +126,9 @@ def softmax(x, size):
 def quantize(vector, scale_factor):
     # absmax quantization
     # scale_factor = 127 / max(vector)
-
     return [round(value * scale_factor) for value in vector]
 
 def dequantize(vector, scale_factor):
-
     return [value / scale_factor for value in vector]
 
 def matmul(xout, x, w, n, d, quant):
@@ -147,13 +145,14 @@ def matmul(xout, x, w, n, d, quant):
         for j in range(n):
             if abs(x[j]) > outlier_threshold:
                 x_outliers.append(x[j])
-                w_outliers.extend(w[j*d: j*d+n])
+                w_outliers.extend(w[j*d: (j+1)*d])
             else:
                 x_non_outliers.append(x[j])
-                w_non_outliers.extend(w[j*d: j*d+n])
+                w_non_outliers.extend(w[j*d: (j+1)*d])
 
         # Matmul outliers in fp16
         res_fp16 = [0.0] * d
+        # print(len(x_outliers), len(w_outliers), d, n)
         res_fp16 = matmul(res_fp16, x_outliers, w_outliers, len(x_outliers), d, False)
 
         # Matmul non-outliers in int8
