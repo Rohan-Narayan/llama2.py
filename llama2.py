@@ -131,43 +131,80 @@ def quantize(vector, scale_factor):
 def dequantize(vector, scale_factor):
     return [value / scale_factor for value in vector]
 
+def matmul_int8(xout, x, w, n, d):
+    cx = max(x, key=abs)
+    # W (d,n), go through all cols
+    cw = [0.0] * d
+    for i in range(d):
+        for j in range(n):
+            cw[i] = max(cw[i], abs(w[i*n+j]))
+
+    for i in range(d):
+        for j in range(n):
+            if cw[i] != 0:
+                w[i*n+j] = round(w[i*n+j] * (127 / cw[i]))
+            else:
+                w[i*n+j] = round(w[i*n+j])
+    if cx != 0:
+        x = [round(value * (127 / cx)) for value in x]
+    else:
+        x = [round(value) for value in x]
+
+    xout = matmul(xout, x, w, n, d, False)
+    sf_dq = [cx*cw_val for cw_val in cw]
+    
+    if sf_dq != 0:
+        xout = [(xout_val * sf_dq_val) / (127*127) for xout_val, sf_dq_val in zip(xout, sf_dq)]
+
+    return xout
+
 def matmul(xout, x, w, n, d, quant):
     # W (d,n) @ x (n,) -> xout (d,)
     # by far the most amount of time is spent inside this little function
     if quant:
         outlier_threshold = 6.0
-        # Extract outliers from x by column and corresponding rows in W
+        # Extract outliers from x by row
         x_outliers = []
         w_outliers = []
         x_non_outliers = []
         w_non_outliers = []
-
+        o = []
         for j in range(n):
             if abs(x[j]) > outlier_threshold:
+                o.append(j)
                 x_outliers.append(x[j])
-                w_outliers.extend(w[j*d: (j+1)*d])
             else:
                 x_non_outliers.append(x[j])
-                w_non_outliers.extend(w[j*d: (j+1)*d])
+
+        # Extract corresponding columns in W
+        for i in range(d):
+            for j in range(n):
+                if j in o:
+                    w_outliers.append(w[i*n + j])
+                else:
+                    w_non_outliers.append(w[i*n + j])
+
+        # Overwrite x and w with outlier values to remove reference to duplicate memory
+        x = x_outliers
+        w = w_outliers
+
+        # Potentially free up duplicate memory
+        del x_outliers
+        del w_outliers
 
         # Matmul outliers in fp16
         res_fp16 = [0.0] * d
         # print(len(x_outliers), len(w_outliers), d, n)
-        res_fp16 = matmul(res_fp16, x_outliers, w_outliers, len(x_outliers), d, False)
+        res_fp16 = matmul(res_fp16, x, w, len(x), d, False)
 
-        # Matmul non-outliers in int8
-        scale_factor = 127 / max(max(x_non_outliers), max(w_non_outliers))
+        # Matmul non-outliers in int8 and convert back to fp16
         res_int8 = [0] * d
-        res_int8 = matmul(res_int8, quantize(x_non_outliers, scale_factor), 
-                          quantize(w_non_outliers, scale_factor), len(x_non_outliers), 
-                          d, False)
-        
-        # Convert non-outliers back to fp16
-        res_int8 = dequantize(res_int8, scale_factor)
+        res_int8 = matmul_int8(res_int8, x_non_outliers, w_non_outliers, 
+                               len(x_non_outliers), d)
 
         # Sum outlier result and non-outlier result
-        xout = res_fp16 + res_int8
-
+        xout = [a + b for a, b in zip(res_fp16, res_int8)]
+        # print(res_fp16[0])
         return xout
     else:
         for i in range(d):
@@ -494,6 +531,10 @@ def run(args):
                 next_token = sample(state.logits)
 
         # Following BOS token (1), sentencepiece decoder strips any leading whitespace
+        # print("logit size", len(state.logits))
+        # print("vocab size", len(vocab))
+        # print("next token", next_token)
+        # print("Next_token", vocab[next_token])
         token_str = (
             vocab[next_token].lstrip()
             if token == 1 and vocab[next_token][0] == ' ' else vocab[next_token]
